@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS candidates (
 CREATE TABLE IF NOT EXISTS relay_results (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
 	address       TEXT    NOT NULL UNIQUE,
+	recipient     TEXT,
 	relay_used    INTEGER NOT NULL DEFAULT 0,
 	dest_chain_id INTEGER,
 	checked_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -200,21 +201,26 @@ func (s *Store) AllCandidates() ([]Candidate, error) {
 type RelayResult struct {
 	ID          int64
 	Address     string
+	Recipient   *string
 	RelayUsed   bool
 	DestChainId *int
 	CheckedAt   time.Time
 }
 
 // SaveRelayResult сохраняет результат проверки relay. Если адрес уже есть — игнорирует.
-func (s *Store) SaveRelayResult(address string, relayUsed bool, destChainId *int) error {
+func (s *Store) SaveRelayResult(address, recipient string, relayUsed bool, destChainId *int) error {
 	used := 0
 	if relayUsed {
 		used = 1
 	}
+	var rec *string
+	if recipient != "" {
+		rec = &recipient
+	}
 	_, err := s.conn.Exec(`
-		INSERT OR IGNORE INTO relay_results (address, relay_used, dest_chain_id, checked_at)
-		VALUES (?, ?, ?, ?)`,
-		address, used, destChainId, time.Now().UTC(),
+		INSERT OR IGNORE INTO relay_results (address, recipient, relay_used, dest_chain_id, checked_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		address, rec, used, destChainId, time.Now().UTC(),
 	)
 	return err
 }

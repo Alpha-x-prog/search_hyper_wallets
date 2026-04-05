@@ -52,13 +52,14 @@ func main() {
 			destChainId = &result.DestChainId
 		}
 
-		if err := store.SaveRelayResult(c.Address, result.Used, destChainId); err != nil {
+		if err := store.SaveRelayResult(c.Address, result.Recipient, result.Used, destChainId); err != nil {
 			log.Printf("  ❌ SaveRelayResult: %v", err)
 			continue
 		}
 
 		if result.Used {
-			log.Printf("  🌉 Relay ИСПОЛЬЗОВАН | destChain=%d", result.DestChainId)
+			log.Printf("  🌉 Relay ИСПОЛЬЗОВАН | recipient=%s | destChain=%d",
+				result.Recipient, result.DestChainId)
 			relayUsed++
 		} else {
 			log.Printf("  🔕 Relay не использован")

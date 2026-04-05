@@ -145,49 +145,56 @@ func (t *Tracker) save(hit models.Hit) {
 	go t.checkBalance(hit.Tx.To, hit.Tx.Hash)
 }
 
-// checkBalance ждёт 1 минуту, запрашивает баланс и кол-во TX.
-// Если balance < 10 и txCount < 8 — сохраняет в таблицу candidates.
+// checkBalance — горутина: ждёт 1 мин, затем последовательно проверяет
+// баланс → кол-во TX → relay. Логирует каждый шаг.
 func (t *Tracker) checkBalance(address, txHash string) {
+	log.Printf("⏳ [1/4] Ждём 1 мин перед проверкой | %s", address)
 	time.Sleep(1 * time.Minute)
 
+	// Шаг 1: баланс
+	log.Printf("🔎 [2/4] Проверяем баланс | %s", address)
 	balance, err := t.client.GetUSDCBalance(address)
 	if err != nil {
-		log.Printf("⚠️  Баланс %s: %v", address, err)
+		log.Printf("⚠️  Баланс ошибка | %s | %v", address, err)
 		return
 	}
-
 	if err := t.store.UpdateBalance(txHash, balance); err != nil {
-		log.Printf("❌ Обновление баланса %s: %v", address, err)
+		log.Printf("❌ UpdateBalance | %s | %v", address, err)
 		return
 	}
-
-	log.Printf("💰 Баланс обновлён | %s | $%.2f USDC", address, balance)
+	log.Printf("💰 Баланс | %s | $%.2f USDC", address, balance)
 
 	if balance >= 10 {
+		log.Printf("🚫 Пропуск (balance=$%.2f >= $10) | %s", balance, address)
 		return
 	}
 
+	// Шаг 2: количество транзакций
+	log.Printf("🔎 [3/4] Проверяем кол-во TX | %s", address)
 	txCount, err := t.client.GetTxCount(address)
 	if err != nil {
-		log.Printf("⚠️  TxCount %s: %v", address, err)
+		log.Printf("⚠️  TxCount ошибка | %s | %v", address, err)
 		return
 	}
+	log.Printf("📊 TxCount | %s | %d транзакций", address, txCount)
 
 	if txCount >= 8 {
+		log.Printf("🚫 Пропуск (txCount=%d >= 8) | %s", txCount, address)
 		return
 	}
 
+	// Сохраняем кандидата
 	if err := t.store.SaveCandidate(address, balance, txCount); err != nil {
-		log.Printf("❌ SaveCandidate %s: %v", address, err)
+		log.Printf("❌ SaveCandidate | %s | %v", address, err)
 		return
 	}
+	log.Printf("🎯 Кандидат сохранён | %s | balance=$%.2f | txCount=%d", address, balance, txCount)
 
-	log.Printf("🎯 Кандидат | %s | balance=$%.2f | txCount=%d", address, balance, txCount)
-
-	// Проверяем relay
+	// Шаг 3: relay
+	log.Printf("🔎 [4/4] Проверяем Relay | %s", address)
 	relayRes, err := t.relay.Check(address)
 	if err != nil {
-		log.Printf("⚠️  Relay %s: %v", address, err)
+		log.Printf("⚠️  Relay ошибка | %s | %v", address, err)
 		return
 	}
 
@@ -196,13 +203,14 @@ func (t *Tracker) checkBalance(address, txHash string) {
 		destChainId = &relayRes.DestChainId
 	}
 
-	if err := t.store.SaveRelayResult(address, relayRes.Used, destChainId); err != nil {
-		log.Printf("❌ SaveRelayResult %s: %v", address, err)
+	if err := t.store.SaveRelayResult(address, relayRes.Recipient, relayRes.Used, destChainId); err != nil {
+		log.Printf("❌ SaveRelayResult | %s | %v", address, err)
 		return
 	}
 
 	if relayRes.Used {
-		log.Printf("🌉 Relay ИСПОЛЬЗОВАН | %s | destChain=%d", address, relayRes.DestChainId)
+		log.Printf("🌉 Relay ИСПОЛЬЗОВАН | %s | recipient=%s | destChain=%d",
+			address, relayRes.Recipient, relayRes.DestChainId)
 	} else {
 		log.Printf("🔕 Relay не использован | %s", address)
 	}

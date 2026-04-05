@@ -18,26 +18,26 @@ func NewRelayClient() *RelayClient {
 	return &RelayClient{http: &http.Client{Timeout: 15 * time.Second}}
 }
 
-type RelayRequest struct {
+type relayRequest struct {
 	ID                 string `json:"id"`
 	User               string `json:"user"`
-	OriginChainId      int    `json:"originChainId"`
+	Recipient          string `json:"recipient"`
 	DestinationChainId int    `json:"destinationChainId"`
 	Status             string `json:"status"`
 }
 
-type RelayResponse struct {
-	Requests []RelayRequest `json:"requests"`
+type relayResponse struct {
+	Requests []relayRequest `json:"requests"`
 }
 
 // RelayResult — итог проверки кошелька через Relay
 type RelayResult struct {
 	Used        bool
+	Recipient   string
 	DestChainId int
 }
 
 // Check проверяет, использовал ли адрес Relay с Arbitrum (chainId=42161).
-// Возвращает (relayUsed, destChainId, error).
 func (c *RelayClient) Check(address string) (RelayResult, error) {
 	url := fmt.Sprintf(
 		"%s/requests/v2?user=%s&originChainId=42161",
@@ -61,7 +61,7 @@ func (c *RelayClient) Check(address string) (RelayResult, error) {
 			continue
 		}
 
-		var result RelayResponse
+		var result relayResponse
 		if err := json.Unmarshal(body, &result); err != nil {
 			return RelayResult{}, fmt.Errorf("unmarshal: %w", err)
 		}
@@ -70,10 +70,11 @@ func (c *RelayClient) Check(address string) (RelayResult, error) {
 			return RelayResult{Used: false}, nil
 		}
 
-		// берём первую (самую свежую) транзакцию
+		first := result.Requests[0]
 		return RelayResult{
 			Used:        true,
-			DestChainId: result.Requests[0].DestinationChainId,
+			Recipient:   first.Recipient,
+			DestChainId: first.DestinationChainId,
 		}, nil
 	}
 	return RelayResult{}, lastErr
