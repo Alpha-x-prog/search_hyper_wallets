@@ -70,8 +70,9 @@ func New(path string) (*Store, error) {
 	if _, err := conn.Exec(schema); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	// мягкая миграция: добавляем колонки/таблицы если их нет
+	// мягкая миграция: добавляем колонки если их нет в старых БД
 	conn.Exec(`ALTER TABLE wallets ADD COLUMN balance REAL`)
+	conn.Exec(`ALTER TABLE relay_results ADD COLUMN recipient TEXT`)
 	return &Store{conn: conn}, nil
 }
 

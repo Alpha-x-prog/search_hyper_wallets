@@ -1,6 +1,7 @@
 package tracker
 
 import (
+	"fmt"
 	"log"
 	"strconv"
 	"time"
@@ -9,25 +10,45 @@ import (
 	"arb_tracker/config"
 	"arb_tracker/db"
 	"arb_tracker/models"
+	"arb_tracker/notify"
 )
 
 // Tracker — основной поллинг-цикл
 type Tracker struct {
-	client *api.Client
-	relay  *api.RelayClient
-	store  *db.Store
-	cache  *SeenCache
-	cfg    *config.Config
+	client  *api.Client
+	relay   *api.RelayClient
+	tg      *notify.Telegram
+	store   *db.Store
+	cache   *SeenCache
+	cfg     *config.Config
+	limiter chan struct{} // токен каждые 3 сек — защита от rate limit
 }
 
 func New(cfg *config.Config, store *db.Store) *Tracker {
 	return &Tracker{
-		client: api.NewClient(cfg),
-		relay:  api.NewRelayClient(),
-		store:  store,
-		cache:  NewSeenCache(),
-		cfg:    cfg,
+		client:  api.NewClient(cfg),
+		relay:   api.NewRelayClient(),
+		tg:      notify.NewTelegram(cfg.TelegramBotToken, cfg.TelegramChannelID),
+		store:   store,
+		cache:   NewSeenCache(),
+		cfg:     cfg,
+		limiter: make(chan struct{}, 1),
 	}
+}
+
+// waitToken блокирует горутину до получения следующего токена (раз в 3 сек)
+func (t *Tracker) waitToken() {
+	<-t.limiter
+}
+
+// startLimiter запускает фоновый тикер, кладущий токен каждые 3 секунды
+func (t *Tracker) startLimiter() {
+	go func() {
+		for {
+			time.Sleep(3 * time.Second)
+			t.limiter <- struct{}{}
+		}
+	}()
 }
 
 // Run запускает ресёрч (или продолжает с last_block), затем входит в поллинг-цикл
@@ -36,6 +57,8 @@ func (t *Tracker) Run() {
 	log.Printf("📍 Bridge:  %s", t.cfg.BridgeAddress)
 	log.Printf("💵 Фильтр: $%.0f – $%.0f USDC", t.cfg.MinUSD, t.cfg.MaxUSD)
 	log.Printf("🗄  БД:     %s", t.cfg.DBPath)
+
+	t.startLimiter()
 
 	lastBlock := t.research()
 
@@ -153,6 +176,7 @@ func (t *Tracker) checkBalance(address, txHash string) {
 
 	// Шаг 1: баланс
 	log.Printf("🔎 [2/4] Проверяем баланс | %s", address)
+	t.waitToken()
 	balance, err := t.client.GetUSDCBalance(address)
 	if err != nil {
 		log.Printf("⚠️  Баланс ошибка | %s | %v", address, err)
@@ -171,6 +195,7 @@ func (t *Tracker) checkBalance(address, txHash string) {
 
 	// Шаг 2: количество транзакций
 	log.Printf("🔎 [3/4] Проверяем кол-во TX | %s", address)
+	t.waitToken()
 	txCount, err := t.client.GetTxCount(address)
 	if err != nil {
 		log.Printf("⚠️  TxCount ошибка | %s | %v", address, err)
@@ -192,6 +217,7 @@ func (t *Tracker) checkBalance(address, txHash string) {
 
 	// Шаг 3: relay
 	log.Printf("🔎 [4/4] Проверяем Relay | %s", address)
+	t.waitToken()
 	relayRes, err := t.relay.Check(address)
 	if err != nil {
 		log.Printf("⚠️  Relay ошибка | %s | %v", address, err)
@@ -211,8 +237,29 @@ func (t *Tracker) checkBalance(address, txHash string) {
 	if relayRes.Used {
 		log.Printf("🌉 Relay ИСПОЛЬЗОВАН | %s | recipient=%s | destChain=%d",
 			address, relayRes.Recipient, relayRes.DestChainId)
+		t.sendTG(address, relayRes.Recipient, relayRes.DestChainId, balance, txCount)
 	} else {
 		log.Printf("🔕 Relay не использован | %s", address)
+	}
+}
+
+// sendTG отправляет уведомление в Telegram канал
+func (t *Tracker) sendTG(sender, recipient string, destChainId int, balance float64, txCount int) {
+	chainName := notify.ChainName(destChainId)
+	text := fmt.Sprintf(
+		"🎯 <b>Новый кандидат найден</b>\n\n"+
+			"👤 <b>Отправитель:</b> <code>%s</code>\n"+
+			"📬 <b>Получатель:</b> <code>%s</code>\n"+
+			"🌐 <b>Куда:</b> %s (chain %d)\n"+
+			"💰 <b>Баланс:</b> $%.2f USDC\n"+
+			"📊 <b>TX Count:</b> %d",
+		sender, recipient, chainName, destChainId, balance, txCount,
+	)
+
+	if err := t.tg.Send(text); err != nil {
+		log.Printf("⚠️  TG ошибка | %v", err)
+	} else {
+		log.Printf("📨 TG уведомление отправлено | %s", sender)
 	}
 }
 

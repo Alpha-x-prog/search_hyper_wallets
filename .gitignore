@@ -1,0 +1,17 @@
+# База данных
+*.db
+*.db-shm
+*.db-wal
+
+# Секреты — никогда не пушить
+config/secrets.go
+
+# Бинарники
+*.exe
+tracker
+fill_balances
+review_candidates
+review_relay
+
+# Go
+vendor/
