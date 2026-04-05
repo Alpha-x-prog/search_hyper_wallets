@@ -14,6 +14,7 @@ import (
 // Tracker — основной поллинг-цикл
 type Tracker struct {
 	client *api.Client
+	relay  *api.RelayClient
 	store  *db.Store
 	cache  *SeenCache
 	cfg    *config.Config
@@ -22,13 +23,14 @@ type Tracker struct {
 func New(cfg *config.Config, store *db.Store) *Tracker {
 	return &Tracker{
 		client: api.NewClient(cfg),
+		relay:  api.NewRelayClient(),
 		store:  store,
 		cache:  NewSeenCache(),
 		cfg:    cfg,
 	}
 }
 
-// Run запускает ресёрч за 24ч, затем входит в поллинг-цикл
+// Run запускает ресёрч (или продолжает с last_block), затем входит в поллинг-цикл
 func (t *Tracker) Run() {
 	log.Println("🚀 Arbitrum USDC Tracker запущен")
 	log.Printf("📍 Bridge:  %s", t.cfg.BridgeAddress)
@@ -47,10 +49,18 @@ func (t *Tracker) Run() {
 	}
 }
 
-// research — разовый прогон истории за ResearchPeriod при старте
+// research — при первом запуске сканирует 48ч, при повторном — продолжает с last_block
 func (t *Tracker) research() int64 {
+	saved := t.store.GetLastBlock()
+	if saved > 0 {
+		log.Printf("♻️  Продолжаем с блока %d (сохранён в БД)", saved)
+		total, _ := t.store.Count()
+		log.Printf("📦 Уже в БД: %d кошельков", total)
+		return saved
+	}
+
 	since := time.Now().Add(-t.cfg.ResearchPeriod)
-	log.Printf("🔍 Ресёрч за последние %v (с %s)...",
+	log.Printf("🔍 Первый запуск — ресёрч за %v (с %s)...",
 		t.cfg.ResearchPeriod, since.Format("02 Jan 15:04"))
 
 	startBlock, err := t.client.GetBlockByTimestamp(since.Unix())
@@ -82,12 +92,16 @@ func (t *Tracker) research() int64 {
 		}
 	}
 
+	if lastBlock > 0 {
+		t.store.SetLastBlock(lastBlock)
+	}
+
 	total, _ := t.store.Count()
 	log.Printf("✅ Ресёрч завершён: %d новых хитов | Всего в БД: %d", hits, total)
 	return lastBlock
 }
 
-// poll — регулярная проверка новых TX
+// poll — регулярная проверка новых TX, сохраняет last_block после каждого цикла
 func (t *Tracker) poll(lastBlock int64) int64 {
 	txs, err := t.client.GetOutboundTxs(lastBlock)
 	if err != nil {
@@ -107,10 +121,14 @@ func (t *Tracker) poll(lastBlock int64) int64 {
 		}
 	}
 
+	if lastBlock > 0 {
+		t.store.SetLastBlock(lastBlock)
+	}
+
 	return lastBlock
 }
 
-// save записывает хит в БД и выводит лог
+// save записывает хит в БД и запускает горутину проверки баланса через 1 минуту
 func (t *Tracker) save(hit models.Hit) {
 	ts, _ := strconv.ParseInt(hit.Tx.TimeStamp, 10, 64)
 	txTime := time.Unix(ts, 0)
@@ -123,6 +141,71 @@ func (t *Tracker) save(hit models.Hit) {
 	total, _ := t.store.Count()
 	log.Printf("💾 Сохранён | %s | %s | $%.0f USDC | Всего в БД: %d",
 		txTime.Format("02 Jan 15:04:05"), hit.Tx.To, hit.Amount, total)
+
+	go t.checkBalance(hit.Tx.To, hit.Tx.Hash)
+}
+
+// checkBalance ждёт 1 минуту, запрашивает баланс и кол-во TX.
+// Если balance < 10 и txCount < 8 — сохраняет в таблицу candidates.
+func (t *Tracker) checkBalance(address, txHash string) {
+	time.Sleep(1 * time.Minute)
+
+	balance, err := t.client.GetUSDCBalance(address)
+	if err != nil {
+		log.Printf("⚠️  Баланс %s: %v", address, err)
+		return
+	}
+
+	if err := t.store.UpdateBalance(txHash, balance); err != nil {
+		log.Printf("❌ Обновление баланса %s: %v", address, err)
+		return
+	}
+
+	log.Printf("💰 Баланс обновлён | %s | $%.2f USDC", address, balance)
+
+	if balance >= 10 {
+		return
+	}
+
+	txCount, err := t.client.GetTxCount(address)
+	if err != nil {
+		log.Printf("⚠️  TxCount %s: %v", address, err)
+		return
+	}
+
+	if txCount >= 8 {
+		return
+	}
+
+	if err := t.store.SaveCandidate(address, balance, txCount); err != nil {
+		log.Printf("❌ SaveCandidate %s: %v", address, err)
+		return
+	}
+
+	log.Printf("🎯 Кандидат | %s | balance=$%.2f | txCount=%d", address, balance, txCount)
+
+	// Проверяем relay
+	relayRes, err := t.relay.Check(address)
+	if err != nil {
+		log.Printf("⚠️  Relay %s: %v", address, err)
+		return
+	}
+
+	var destChainId *int
+	if relayRes.Used {
+		destChainId = &relayRes.DestChainId
+	}
+
+	if err := t.store.SaveRelayResult(address, relayRes.Used, destChainId); err != nil {
+		log.Printf("❌ SaveRelayResult %s: %v", address, err)
+		return
+	}
+
+	if relayRes.Used {
+		log.Printf("🌉 Relay ИСПОЛЬЗОВАН | %s | destChain=%d", address, relayRes.DestChainId)
+	} else {
+		log.Printf("🔕 Relay не использован | %s", address)
+	}
 }
 
 // applyFilter проверяет диапазон суммы

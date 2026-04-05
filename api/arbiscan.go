@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"arb_tracker/config"
 	"arb_tracker/models"
@@ -26,29 +27,37 @@ func NewClient(cfg *config.Config) *Client {
 	}
 }
 
-// get выполняет GET-запрос и десериализует JSON в out
+// get выполняет GET-запрос и десериализует JSON в out (3 попытки при сетевых ошибках)
 func (c *Client) get(url string, out interface{}) error {
-	resp, err := c.http.Get(url)
-	if err != nil {
-		return fmt.Errorf("http get: %w", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		resp, err := c.http.Get(url)
+		if err != nil {
+			lastErr = fmt.Errorf("http get: %w", err)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			continue
+		}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read body: %w", err)
-	}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read body: %w", err)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			continue
+		}
 
-	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("unmarshal: %w", err)
+		if err := json.Unmarshal(body, out); err != nil {
+			return fmt.Errorf("unmarshal: %w", err)
+		}
+		return nil
 	}
-	return nil
+	return lastErr
 }
 
 // GetOutboundTxs возвращает USDC-переводы FROM bridgeAddress начиная с startBlock
 func (c *Client) GetOutboundTxs(startBlock int64) ([]models.TokenTx, error) {
 	url := fmt.Sprintf(
-		"%s?module=account&action=tokentx&address=%s&contractaddress=%s&startblock=%d&sort=asc&apikey=%s",
+		"%s?chainid=42161&module=account&action=tokentx&address=%s&contractaddress=%s&startblock=%d&sort=asc&apikey=%s",
 		c.cfg.BaseURL,
 		c.cfg.BridgeAddress,
 		c.cfg.USDCAddress,
@@ -56,18 +65,36 @@ func (c *Client) GetOutboundTxs(startBlock int64) ([]models.TokenTx, error) {
 		c.cfg.APIKey,
 	)
 
-	var result models.TokenTxResponse
-	if err := c.get(url, &result); err != nil {
+	var raw struct {
+		Status  string          `json:"status"`
+		Message string          `json:"message"`
+		Result  json.RawMessage `json:"result"`
+	}
+	if err := c.get(url, &raw); err != nil {
 		return nil, err
 	}
 
-	if result.Status != "1" && result.Message != "No transactions found" {
-		return nil, fmt.Errorf("arbiscan error: %s", result.Message)
+	if raw.Status != "1" {
+		if raw.Message == "No transactions found" {
+			return nil, nil
+		}
+		// result может быть строкой с описанием ошибки
+		var errMsg string
+		_ = json.Unmarshal(raw.Result, &errMsg)
+		if errMsg != "" {
+			return nil, fmt.Errorf("arbiscan error: %s", errMsg)
+		}
+		return nil, fmt.Errorf("arbiscan error: %s", raw.Message)
+	}
+
+	var txs []models.TokenTx
+	if err := json.Unmarshal(raw.Result, &txs); err != nil {
+		return nil, fmt.Errorf("unmarshal txs: %w", err)
 	}
 
 	// Фильтруем только исходящие от bridge
 	var out []models.TokenTx
-	for _, tx := range result.Result {
+	for _, tx := range txs {
 		if strings.EqualFold(tx.From, c.cfg.BridgeAddress) {
 			out = append(out, tx)
 		}
@@ -78,7 +105,7 @@ func (c *Client) GetOutboundTxs(startBlock int64) ([]models.TokenTx, error) {
 // GetBlockByTimestamp возвращает номер блока ближайший к переданному unix-timestamp
 func (c *Client) GetBlockByTimestamp(ts int64) (int64, error) {
 	url := fmt.Sprintf(
-		"%s?module=block&action=getblocknobytime&timestamp=%d&closest=before&apikey=%s",
+		"%s?chainid=42161&module=block&action=getblocknobytime&timestamp=%d&closest=before&apikey=%s",
 		c.cfg.BaseURL, ts, c.cfg.APIKey,
 	)
 	var result struct {
@@ -98,7 +125,7 @@ func (c *Client) GetBlockByTimestamp(ts int64) (int64, error) {
 // GetUSDCBalance возвращает баланс USDC адреса в человекочитаемом виде
 func (c *Client) GetUSDCBalance(address string) (float64, error) {
 	url := fmt.Sprintf(
-		"%s?module=account&action=tokenbalance&contractaddress=%s&address=%s&tag=latest&apikey=%s",
+		"%s?chainid=42161&module=account&action=tokenbalance&contractaddress=%s&address=%s&tag=latest&apikey=%s",
 		c.cfg.BaseURL,
 		c.cfg.USDCAddress,
 		address,
@@ -111,6 +138,39 @@ func (c *Client) GetUSDCBalance(address string) (float64, error) {
 	}
 
 	return parseTokenAmount(result.Result, 6)
+}
+
+// GetTxCount возвращает количество обычных транзакций кошелька (до 10).
+// Нам важно только знать < 8 или нет — поэтому тянем максимум 10 штук.
+func (c *Client) GetTxCount(address string) (int, error) {
+	url := fmt.Sprintf(
+		"%s?chainid=42161&module=account&action=txlist&address=%s&page=1&offset=10&sort=asc&apikey=%s",
+		c.cfg.BaseURL, address, c.cfg.APIKey,
+	)
+	var raw struct {
+		Status  string          `json:"status"`
+		Message string          `json:"message"`
+		Result  json.RawMessage `json:"result"`
+	}
+	if err := c.get(url, &raw); err != nil {
+		return 0, err
+	}
+	if raw.Status != "1" {
+		if raw.Message == "No transactions found" {
+			return 0, nil
+		}
+		var errMsg string
+		_ = json.Unmarshal(raw.Result, &errMsg)
+		if errMsg != "" {
+			return 0, fmt.Errorf("arbiscan error: %s", errMsg)
+		}
+		return 0, fmt.Errorf("arbiscan error: %s", raw.Message)
+	}
+	var txs []json.RawMessage
+	if err := json.Unmarshal(raw.Result, &txs); err != nil {
+		return 0, fmt.Errorf("unmarshal txs: %w", err)
+	}
+	return len(txs), nil
 }
 
 // ParseTxAmount переводит сырое значение токена в float64 с учётом decimals
